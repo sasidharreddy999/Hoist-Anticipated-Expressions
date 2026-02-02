@@ -1,0 +1,388 @@
+From 4ececfb518157193d40848a6e7138abe29ca3c89 Mon Sep 17 00:00:00 2001
+From: Gunreddy Sasidhar Reddy <gunreddysasidharreddy@gmail.com>
+Date: Fri, 7 Mar 2025 16:08:06 +0530
+Subject: [PATCH] Implemented hoisting of anticipated expressions
+
+---
+ .../Utils/HoistAnticipatedExpressions.h       |  42 +++
+ llvm/lib/Passes/PassBuilder.cpp               |   1 +
+ llvm/lib/Passes/PassRegistry.def              |   1 +
+ llvm/lib/Transforms/Utils/CMakeLists.txt      |   1 +
+ .../Utils/HoistAnticipatedExpressions.cpp     | 278 ++++++++++++++++++
+ 5 files changed, 323 insertions(+)
+ create mode 100644 llvm/include/llvm/Transforms/Utils/HoistAnticipatedExpressions.h
+ create mode 100644 llvm/lib/Transforms/Utils/HoistAnticipatedExpressions.cpp
+
+diff --git a/llvm/include/llvm/Transforms/Utils/HoistAnticipatedExpressions.h b/llvm/include/llvm/Transforms/Utils/HoistAnticipatedExpressions.h
+new file mode 100644
+index 000000000000..099c88ed9267
+--- /dev/null
++++ b/llvm/include/llvm/Transforms/Utils/HoistAnticipatedExpressions.h
+@@ -0,0 +1,42 @@
++#ifndef LLVM_TRANSFORMS_UTILS_HOISTANTICIPATEDEXPRESSIONS_H
++#define LLVM_TRANSFORMS_UTILS_HOISTANTICIPATEDEXPRESSIONS_H
++
++#include "llvm/ADT/BitVector.h"
++#include "llvm/ADT/DenseSet.h"
++#include "llvm/ADT/SetVector.h"
++#include "llvm/ADT/SmallPtrSet.h"
++#include "llvm/IR/CFG.h"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/PassManager.h"
++#include "llvm/Pass.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/raw_ostream.h"
++#include <map>
++#include <set>
++#include <stack>
++
++namespace llvm {
++
++using ExpressionSet = DenseSet<size_t>;
++
++class HoistAnticipatedExpressions
++    : public PassInfoMixin<HoistAnticipatedExpressions> {
++public:
++  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
++
++  void computeAnticipatedExpressions(
++      Function &F, DenseMap<BasicBlock *, ExpressionSet> &GENMap,
++      DenseMap<BasicBlock *, ExpressionSet> &KILLMap,
++      DenseMap<BasicBlock *, ExpressionSet> &INMap,
++      DenseMap<BasicBlock *, ExpressionSet> &OUTMap,
++      DenseMap<size_t, SmallVector<Instruction *, 4>> &ExprMap);
++
++  void
++  hoistExpressions(Function &F, DenseMap<BasicBlock *, ExpressionSet> &OUTMap,
++                   DenseMap<size_t, SmallVector<Instruction *, 4>> &ExprMap);
++};
++
++} // namespace llvm
++
++#endif // LLVM_TRANSFORMS_UTILS_HOISTANTICIPATEDEXPRESSIONS_H
+\ No newline at end of file
+diff --git a/llvm/lib/Passes/PassBuilder.cpp b/llvm/lib/Passes/PassBuilder.cpp
+index 5dbb1e2f4987..9fc2ddb13126 100644
+--- a/llvm/lib/Passes/PassBuilder.cpp
++++ b/llvm/lib/Passes/PassBuilder.cpp
+@@ -290,6 +290,7 @@
+ #include "llvm/Transforms/Utils/EntryExitInstrumenter.h"
+ #include "llvm/Transforms/Utils/FixIrreducible.h"
+ #include "llvm/Transforms/Utils/HelloWorld.h"
++#include "llvm/Transforms/Utils/HoistAnticipatedExpressions.h"
+ #include "llvm/Transforms/Utils/InjectTLIMappings.h"
+ #include "llvm/Transforms/Utils/InstructionNamer.h"
+ #include "llvm/Transforms/Utils/LCSSA.h"
+diff --git a/llvm/lib/Passes/PassRegistry.def b/llvm/lib/Passes/PassRegistry.def
+index 3b92823cd283..db78f923458d 100644
+--- a/llvm/lib/Passes/PassRegistry.def
++++ b/llvm/lib/Passes/PassRegistry.def
+@@ -358,6 +358,7 @@ FUNCTION_PASS("guard-widening", GuardWideningPass())
+ FUNCTION_PASS("gvn-hoist", GVNHoistPass())
+ FUNCTION_PASS("gvn-sink", GVNSinkPass())
+ FUNCTION_PASS("helloworld", HelloWorldPass())
++FUNCTION_PASS("hoist-anticipated-expressions", HoistAnticipatedExpressions())
+ FUNCTION_PASS("indirectbr-expand", IndirectBrExpandPass(TM))
+ FUNCTION_PASS("infer-address-spaces", InferAddressSpacesPass())
+ FUNCTION_PASS("infer-alignment", InferAlignmentPass())
+diff --git a/llvm/lib/Transforms/Utils/CMakeLists.txt b/llvm/lib/Transforms/Utils/CMakeLists.txt
+index 1b811c7cebef..bcc52605566f 100644
+--- a/llvm/lib/Transforms/Utils/CMakeLists.txt
++++ b/llvm/lib/Transforms/Utils/CMakeLists.txt
+@@ -32,6 +32,7 @@ add_llvm_component_library(LLVMTransformUtils
+   GlobalStatus.cpp
+   GuardUtils.cpp
+   HelloWorld.cpp
++  HoistAnticipatedExpressions.cpp
+   InlineFunction.cpp
+   InjectTLIMappings.cpp
+   InstructionNamer.cpp
+diff --git a/llvm/lib/Transforms/Utils/HoistAnticipatedExpressions.cpp b/llvm/lib/Transforms/Utils/HoistAnticipatedExpressions.cpp
+new file mode 100644
+index 000000000000..7bda94bba094
+--- /dev/null
++++ b/llvm/lib/Transforms/Utils/HoistAnticipatedExpressions.cpp
+@@ -0,0 +1,278 @@
++#include "llvm/Transforms/Utils/HoistAnticipatedExpressions.h"
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/Dominators.h"
++#include "llvm/IR/Function.h"
++#include "llvm/Support/FileSystem.h"
++#include "llvm/Support/ToolOutputFile.h"
++#include "llvm/Support/raw_ostream.h"
++
++#include <queue>
++#include <unordered_set>
++
++using namespace llvm;
++
++PreservedAnalyses
++HoistAnticipatedExpressions::run(Function &F, FunctionAnalysisManager &AM) {
++  bool changed = true;
++  while (changed) {
++    changed = false;
++    DenseMap<BasicBlock *, ExpressionSet> GENMap, KILLMap, INMap, OUTMap;
++    DenseMap<size_t, SmallVector<Instruction *, 4>> ExprMap;
++
++    computeAnticipatedExpressions(F, GENMap, KILLMap, INMap, OUTMap, ExprMap);
++
++    for (BasicBlock &BB : F) {
++      if (!OUTMap[&BB].empty()) {
++        changed = true;
++      }
++    }
++
++    hoistExpressions(F, OUTMap, ExprMap);
++  }
++
++  llvm::outs() << F;
++  return PreservedAnalyses::all();
++}
++
++bool isExpression(const Instruction *I) {
++  return isa<BinaryOperator>(I) || isa<CastInst>(I) || isa<CallInst>(I);
++}
++
++bool areOperandsDefinedBefore(Instruction *I) {
++  /** Start iterating from the instruction before the current instruction we
++     itearte backward
++     and check if any operand of current instruction is defined before it or
++     not. */
++
++  auto reverseInstIter = I->getReverseIterator();
++  ++reverseInstIter;
++  auto reverseIterEnd = I->getParent()->rend();
++
++  for (; reverseInstIter != reverseIterEnd; ++reverseInstIter) {
++    Instruction *CurrentInst = &*reverseInstIter;
++    for (Value *Op : I->operands()) {
++      // If defined before then return true
++      if (CurrentInst == Op) {
++        return true;
++      }
++    }
++  }
++
++  // If it is not defined before then we return false
++  return false;
++}
++
++/** This computes the hash of the given instruction */
++size_t hashExpression(Instruction *I) {
++
++  if (auto *BinOp = dyn_cast<BinaryOperator>(I)) {
++    size_t Hash = static_cast<size_t>(BinOp->getOpcode());
++    for (Value *Op : BinOp->operands()) {
++      Hash ^= hash_value(Op);
++    }
++
++    return Hash;
++  }
++
++  if (auto *Cast = dyn_cast<CastInst>(I)) {
++    size_t Hash = static_cast<size_t>(Cast->getOpcode());
++    Hash ^= hash_value(Cast->getOperand(0));
++    return Hash;
++  }
++
++  if (auto *Call = dyn_cast<CallInst>(I)) {
++    size_t Hash = hash_value(Call->getCalledFunction());
++    for (Value *Op : Call->args()) {
++      Hash ^= hash_value(Op);
++    }
++    return Hash;
++  }
++
++  return 0;
++}
++
++/** This function computes the anticipated expressions by using using the
++   following algorithm OUT[B] = intersection of IN[S] for all successors S IN[B]
++   = GEN[B] ∪ (OUT[B] \ KILL[B]) we run the above algorithm iteratively untill
++   no changes are made to IN and OUT sets.
++*/
++void HoistAnticipatedExpressions::computeAnticipatedExpressions(
++    Function &F, DenseMap<BasicBlock *, ExpressionSet> &GENMap,
++    DenseMap<BasicBlock *, ExpressionSet> &KILLMap,
++    DenseMap<BasicBlock *, ExpressionSet> &INMap,
++    DenseMap<BasicBlock *, ExpressionSet> &OUTMap,
++    DenseMap<size_t, SmallVector<Instruction *, 4>> &ExprMap) {
++
++  /** we store set of all possible expressions in the function. */
++  ExpressionSet universalSet;
++
++  for (BasicBlock &BB : F) {
++    ExpressionSet GEN, KILL;
++    for (auto I = BB.rbegin(), E = BB.rend(); I != E; ++I) {
++
++      if (isExpression(&*I)) {
++        size_t ExprHash = hashExpression(&*I);
++        if (!areOperandsDefinedBefore(&*I)) {
++          GEN.insert(ExprHash);
++        } else {
++          KILL.insert(ExprHash);
++        }
++
++        ExprMap[ExprHash].push_back(&*I);
++        universalSet.insert(ExprHash);
++      }
++    }
++
++    GENMap[&BB] = GEN;
++    KILLMap[&BB] = KILL;
++  }
++
++  // we initiaize IN and OUT sets with default values.
++  for (BasicBlock &BB : F) {
++    INMap[&BB] = universalSet;
++    OUTMap[&BB] = ExpressionSet();
++  }
++
++  bool modified = true;
++  /** Iterate till there are no more any changes in the IN and OUT sets of any
++   * block. */
++  while (modified) {
++
++    modified = false;
++    for (BasicBlock &BB : F) {
++      ExpressionSet &IN = INMap[&BB];
++      ExpressionSet &OUT = OUTMap[&BB];
++      ExpressionSet &GEN = GENMap[&BB];
++      ExpressionSet &KILL = KILLMap[&BB];
++
++      /** OUT[B] = intersection of IN[S] for all successors S */
++      ExpressionSet NewOUT;
++      bool FirstSuccessor = true;
++
++      for (BasicBlock *Succ : successors(&BB)) {
++        if (FirstSuccessor) {
++          NewOUT = INMap[Succ];
++          FirstSuccessor = false;
++        } else {
++          ExpressionSet Intersection;
++          for (size_t ExprHash : NewOUT) {
++
++            if (INMap[Succ].count(ExprHash)) {
++              Intersection.insert(ExprHash);
++            }
++          }
++          NewOUT = Intersection;
++        }
++      }
++
++      /** IN[B] = GEN[B] ∪ (OUT[B] \ KILL[B]) */
++      ExpressionSet NewIN = GEN;
++      for (size_t ExprHash : NewOUT) {
++        if (!KILL.count(ExprHash)) {
++          NewIN.insert(ExprHash);
++        }
++      }
++
++      /** Check if IN or OUT sets have changed
++          if changed update with new sets */
++      if (NewIN != IN || NewOUT != OUT) {
++        IN = NewIN;
++        OUT = NewOUT;
++        modified = true;
++      }
++    }
++  }
++}
++
++SmallVector<BasicBlock *, 32> getPostOrderTraversal(DomTreeNode *RootNode) {
++  SmallVector<BasicBlock *, 32> PostOrder;
++  std::stack<DomTreeNode *> Stack;
++  std::unordered_set<DomTreeNode *> Visited;
++
++  Stack.push(RootNode);
++  while (!Stack.empty()) {
++
++    DomTreeNode *Node = Stack.top();
++    bool HasUnvisitedChildren = false;
++
++    for (DomTreeNode *Child : *Node) {
++      if (Visited.find(Child) == Visited.end()) {
++        Stack.push(Child);
++        HasUnvisitedChildren = true;
++      }
++    }
++
++    if (!HasUnvisitedChildren) {
++      Stack.pop();
++      Visited.insert(Node);
++      PostOrder.push_back(Node->getBlock());
++    }
++  }
++
++  return PostOrder;
++}
++
++void HoistAnticipatedExpressions::hoistExpressions(
++    Function &F, DenseMap<BasicBlock *, ExpressionSet> &OUTMap,
++    DenseMap<size_t, SmallVector<Instruction *, 4>> &ExprMap) {
++  DominatorTree DT;
++  DT.recalculate(F);
++
++  // Compute reverse post-order traversal
++  DomTreeNode *RootNode = DT.getRootNode();
++  SmallVector<BasicBlock *, 32> PostOrder = getPostOrderTraversal(RootNode);
++
++  SmallVector<BasicBlock *, 32> ReversePostOrder;
++  ReversePostOrder.append(PostOrder.rbegin(), PostOrder.rend());
++
++  for (BasicBlock *BB : ReversePostOrder) {
++    /** We get anticipated expressions in the OUT set of BB */
++    ExpressionSet &anticipatedExpr = OUTMap[BB];
++    DenseMap<size_t, Instruction *> HoistedExprs;
++
++    for (size_t ExprHash : anticipatedExpr) {
++
++      if (!ExprMap.count(ExprHash))
++        continue;
++
++      Instruction *SampleInst = ExprMap[ExprHash].front();
++      Instruction *NewInst = SampleInst->clone();
++
++      NewInst->insertBefore(BB->getTerminator());
++      HoistedExprs[ExprHash] = NewInst;
++
++      auto it = ExprMap.find(ExprHash);
++      if (it != ExprMap.end()) {
++        SmallVector<Instruction *, 4> &instructionVector = it->second;
++        for (Instruction *instr : instructionVector) {
++          instr->replaceAllUsesWith(NewInst);
++          instr->eraseFromParent();
++        }
++      } else {
++        errs() << "Key " << ExprHash << " not found in the DenseMap.\n";
++      }
++    }
++
++    // We eliminate redundant expressions in dominated blocks
++    for (BasicBlock *BB : ReversePostOrder) {
++      ExpressionSet &OUT = OUTMap[BB];
++
++      for (BasicBlock *OtherBB : ReversePostOrder) {
++
++        /** Check if the other block is dominated by the current block
++        and iterate over all instructions in the dominated block */
++        if (DT.dominates(BB, OtherBB)) {
++
++          for (auto I = OtherBB->begin(), E = OtherBB->end(); I != E; ++I) {
++            ExpressionSet &OtherOUT = OUTMap[BB];
++            for (size_t ExprHash : OUT) {
++              if (HoistedExprs.count(ExprHash)) {
++                OtherOUT.erase(ExprHash);
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++}
+\ No newline at end of file
+-- 
+2.34.1
+
